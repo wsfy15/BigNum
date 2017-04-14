@@ -11,6 +11,15 @@ int bn_copy(bignum *x, const bignum *y);
 int bn_set_word(bignum *x, const bn_digit word);
 void bn_swap(bignum *x, bignum *y);
 void bn_clamp(bignum *x);
+int bn_cmp_abs(const bignum *x, const bignum *y);
+int bn_cmp_bn(const bignum *x, const bignum *y);
+boolean bn_get_bit(const bignum *x, const size_t pos);
+int bn_set_bit(bignum *x, const size_t pos, boolean value);
+size_t bn_lsb(const bignum *x);
+size_t bn_msb(const bignum *x);
+size_t bn_size(const bignum *x);
+
+
 
 
 //bignum结构初始化，未分配内存。
@@ -188,6 +197,177 @@ void bn_clamp(bignum *x)
 	if (x->used == 0)
 		x->sign = 1;
 }//bn_clamp
+
+/*
+绝对值比较，有符号数比较，多精度数和单精度数比较。
+约定：所有的比较操作，如果 x > y，返回 1；x == y，返回 0；x < y，返回 -1。
+*/
+
+/*
+先比较位数，位数大的绝对值更大，如果位数相同，从高位到低位依次比较两个大整数中相同位的数位大小
+*/
+int bn_cmp_abs(const bignum *x, const bignum *y)
+{
+	size_t i;
+
+	if (x->used > y->used) return  1;
+	if (x->used < y->used) return -1;
+
+	//x 和 y 的位数相同，依次比较相同位的大小。
+	for (i = x->used - 1; i >= 0; i--)
+	{
+		if (x->dp[i] > y->dp[i]) return  1;
+		if (x->dp[i] < y->dp[i]) return -1;
+	}
+	return 0;
+}//bn_cmp_abs
+
+/*
+有符号数比较
+1. x 和 y 两个数异号：非负数大于负数。
+2. x 和 y 两个数同号：若 x 和 y 都是非负整数，比较 x 和 y 的绝对值大小；
+若 x 和 y 都是负整数，比较 y 和 x 的绝对值大小。
+*/
+
+int bn_cmp_bn(const bignum *x, const bignum *y)
+{
+	if (x->sign == 1 && y->sign == -1) return  1;
+	if (y->sign == 1 && x->sign == -1) return -1;
+
+	if (x->sign == 1)			//都是正数
+		return bn_cmp_abs(x, y);
+	else						//都是负数
+		return bn_cmp_abs(y, x);
+}//bn_cmp_bn
+
+/*
+多精度数和单精度数比较
+简单来说就是将一个大整数与一个有符号的单精度数（bn_sint类型）进行比较。
+有了前面的大整数与大整数之间的有符号比较操作，直接把有符号的单精度数赋值给一个临时的大整数类型变量t，
+然后调用bn_cmp_bn函数进行比较。
+*/
+int bn_cmp_int(const bignum *x, const bn_sint y)
+{
+	bignum t[1];
+	bn_digit p[1];
+
+	p[0] = (y >= 0) ? y : -y;
+	t->sign = (y >= 0) ? 1 : -1;
+	t->used = (y == 0) ? 0 : 1;   //注意 bignum 为 0 时，规定 used = 0.
+	t->alloc = 1;
+	t->dp = p;
+
+	return bn_cmp_bn(x, t);
+}//bn_cmp_int
+
+//返回指定下标 pos 的比特位
+boolean bn_get_bit(const bignum *x, const size_t pos)
+{
+	if (x->alloc*biL <= pos)
+		return 0;
+	boolean bit;
+
+	//bit = 1 & (x->dp[pos / biL] >> (pos%biL));		//每个数位的比特从0 到 31 
+	bit = (x->dp[pos / biL] >> (pos & (biL - 1))) & 1;	//直接做位运算更快
+	//在 2 的补码运算中，计算 a mod (2^n) 等价于 a AND (2^n - 1)。
+
+	return bit;
+}//bn_get_bit
+
+/*
+给定下标值 pos 设置对应位置的比特位
+先找到 pos 对应的比特位的位置。假设 pos = 35，则 offset = pos / biL = 1， mod = pos / biL = 3。
+找到对应的位置后，要先把该位的值清空，具体的做法是：将 1 左移 mod = 3 位，然后取反，
+这时操作结果的二进制就会是 1111 1111 1111 1111 1111 1111 1111 0111，
+与大整数的第二个数位（对应数组下标为 1）进行与运算，便清空该位的值。
+然后将函数传入的 boolean 类型的 value 左移 mod = 3 位后与大整数的第二个数位做或运算
+即可把新的比特位设置好。
+*/
+int bn_set_bit(bignum *x, const size_t pos, boolean value)
+{
+	int ret = 0;
+	size_t offset, mod;
+
+	//pos is zero base number
+
+	if (value != TRUE && value != FALSE)
+		return BN_INVALID_INPUT;
+
+	offset = pos / biL;
+	mod = pos & (biL - 1);
+
+	if (pos >= x->alloc * biL)
+	{
+		if (value == FALSE) return 0; 
+		//如果pos超过了分配的数位并且value为0，则无需操作，因为高位默认为0，否则需要增加精度。
+		BN_CHECK(bn_grow(x, offset + 1));
+	}
+
+	x->dp[offset] &= ~((bn_digit)1 << mod);				//对指定位清零
+	if(value != FALSE)
+		x->dp[offset] |= ((bn_digit)1 << mod);		//对指定位置数
+
+	x->used = x->alloc;  
+	//如果bignum的精度增加，则需要从最左边的数位开始往右检查有效数位，保证used值的正确。
+	bn_clamp(x);  //压缩多余位
+
+clean:
+	return ret;
+}//bn_set_bit
+
+
+
+/*
+返回  有效比特  位   的数量
+这个算法的意义在于可以计算出一个 bignum 的实际比特大小
+有效比特位是指从左起第一个不为 0 的比特位开始到最右比特位为止的中间所有比特位。
+*/
+size_t bn_msb(const bignum *x)
+{
+	size_t i, j;
+
+	i = x->used - 1;
+	//最高数位不能全为0
+	for (j = biL; j > 0; j--)
+		if (((x->dp[i] >> (j - 1)) & 1) != 0)
+			break;
+
+	return biL * i + j;
+}//bn_msb
+
+/*
+返回最低有效比特位前 0 的数量
+最低有效比特位是指从右起第一个不为 0 的比特位
+*/
+size_t bn_lsb(const bignum *x)
+{
+	size_t i, j;
+
+	for (i = 0; i < x->used; i++)
+	{
+		if (x->dp[i] != 0)
+		{
+			for (j = 0; j < biL; j++)
+			{
+				if (((x->dp[i] >> j) & 1) != 0)
+					return i * biL + j;
+			}
+		}
+	}
+	return 0;
+}//bn_lsb
+
+/*
+返回 bignum 的字节大小
+这里要注意的是：这个操作不是返回 bignum 占用了多少内存，例如对于 bignum x，
+即使一开始分配了 3 个单元的内存，其字节大小仍然是 8 byte。
+计算 bignum 的字节大小，只需要将 x 的比特大小加上 7 除以 8 即可。
+加上 7 的目的是避免 x 的比特位不是 8 的倍数时除完之后少了一个字节
+*/
+size_t bn_size(const bignum *x)
+{
+	return ((bn_msb(x) + 7) >> 3);
+}//bn_size
 
 
 
