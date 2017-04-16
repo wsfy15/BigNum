@@ -22,6 +22,95 @@ typedef unsigned int        uint32;
 typedef unsigned long long  uint64;
 #endif
 
+#ifdef _MSC_VER
+#define LL(v)   (v##ui64)
+#else
+#define LL(v)   (v##ULL)
+#endif
+
+#define BN_HAVE_LONG_LONG		//有双精度变量存在的环境（64位系统）
+
+#ifdef BN_HAVE_LONG_LONG
+#define BN_MASK0   LL(0xFFFFFFFFFFFFFFFF)
+#else
+#define BN_MASK0   0xFFFFFFFFUL
+#endif
+
+/*
+	A. 单精度和双精度变量都存在的环境：
+1. ADDC_INIT 定义双精度类型的变量 rr 用于存放累加的结果。
+用双精度的原因是单精度累加后结果可能要用双精度类型才能完整存储，简单的数学证明如下：
+
+设单精度类型是一个 n 位的整形，则能表示的最大无符号整数是：2^n - 1，两个最大整数相加，
+结果是：2 * (2^n - 1) = 2^(n + 1) - 2，结果超出单精度类型所能表示的范围，因此至少需要双精度类型才能完整表示。
+
+2. 在 ADDC_CORE 中，先计算 x 和 y 每一位的和，并和来自低位的进位相加，结果放在 rr 中；
+然后将 rr 和掩码 BN_MASK0 相与提取出本位，存放在目标整数的对应数位上；
+最后将变量 rr 右移 biL 位计算出进位结果。记住 rr 是双精度的，
+累加结果的低半部分是本位结果，高半部分是进位结果。
+
+3. 在 ADDC_FINAL 中，数位多的整数的剩余数位与来自低位的进位相加，
+然后从结果中提取本位存储到目标整数的对应数位上，最后 rr 右移 biL 位计算新的进位值。
+
+4. ADDC_STOP 宏将剩余的最后一个进位传递到结果的最高数位上。注意，这个进位可能是 0，也有可能不是 0。
+
+	B. 只有单精度的环境：
+1. ADDC_INIT 宏定义了三个变量：累加的本位结果 rr， 临时变量 t， 进位值 c。
+
+2. 这里的 ADDC_CORE 计算稍微复杂点。第一步，将 x 的某一位存放到临时变量 t 中。
+第二步，变量 t 和来自低位的进位 c 相加，得到结果的本位值，存放于变量 t 中。
+这里要注意的是所有变量都是单精度类型，如果结果大于单精度数所能表示的范围，则会产生溢出，
+相当于做了一次 mod 2^n 运算，所以得到的是结果的本位值。
+第三步，判断前一步是否产生了进位。在加法中，如果结果产生进位，则本位的值小于两个加数。
+所以，如果有进位，则 t < c，比较的结果为 1。
+第四步，计算 t 和第二个整数对应数位的和，结果的本位存放于变量 rr 中。
+第五步，判断是否产生进位，原理和第三步一样。最后一步，将最终的本位结果送到目标整数的对应数位上。
+
+3. ADDC_FINAL 用于传递剩余的进位，和上面的 ADDC_FINAL 原理一样，只不过是本位和进位是用两个变量表示而已。
+
+4. ADDC_STOP 宏将剩余的最后一个进位传递到结果的最高数位上。仍然要注意，这个进位可能是 0，也有可能不是 0。
+*/
+
+#ifdef BN_HAVE_LONG_LONG
+#define ADDC_INIT                                  \
+    bn_udbl rr = 0;                                \
+
+#define ADDC_CORE                                  \
+    rr += (bn_udbl)(*px) + (*py);                  \
+    *pz = (bn_digit)(rr & BN_MASK0);               \
+    rr >>= biL;                                    \
+
+#define ADDC_FINAL                                 \
+    rr += (bn_udbl)(tmp->dp[i]);                   \
+    *pz = (bn_digit)(rr & BN_MASK0);               \
+    rr >>= biL;                                    \
+
+#define ADDC_STOP                                  \
+    z->dp[max] = (bn_digit)(rr & BN_MASK0);        \
+
+#else
+#define ADDC_INIT                   \
+    bn_digit rr, t, c = 0;          \
+
+#define ADDC_CORE                   \
+    t = *px;                        \
+    t = (t + c) & BN_MASK0;         \
+    c = (t < c);                    \
+    rr = (t + *py) & BN_MASK0;      \
+    c += (rr < t);                  \
+    *pz = rr;                       \
+
+#define ADDC_FINAL                  \
+    t = tmp->dp[i];                 \
+    t = (t + c) & BN_MASK0;         \
+    c = (t < c);                    \
+    *pz = t;                        \
+
+#define ADDC_STOP                   \
+    z->dp[max] = c;                 \
+
+#endif
+
 typedef uint8 boolean;
 #define TRUE                  1
 #define FALSE                 0
@@ -82,7 +171,62 @@ typedef struct
 #define BN_MALLOC			 malloc             
 #define BN_FREE              free               
 
+#define BN_IS_ZERO(x)                 ((x->used == 0) ? 1 : 0)
+#define BN_MIN(x, y)                  (((x) < (y)) ? (x) : (y)) 
+
 void bn_init(bignum *x);
 int bn_init_size(bignum *x, size_t nlimbs);
 
+#define IN_X64							//只有单精度变量的情况
+//#define IN_X86						//单双精度变量都有的情况
 
+#ifdef IN_X64
+#define COMBA_INIT                                  \
+{                                                   \
+    bn_digit a0, a1, b0, b1;                        \
+    bn_digit t0, t1, r0, r1;                        \
+
+#define COMBA_MULADDC                               \
+                                                    \
+    a0 = (*px << biLH) >> biLH;                     \
+    b0 = (*py << biLH) >> biLH;                     \
+    a1 = *px++ >> biLH;                             \
+    b1 = *py-- >> biLH;                             \
+    r0 = a0 * b0;                                   \
+    r1 = a1 * b1;                                   \
+    t0 = a1 * b0;                                   \
+    t1 = a0 * b1;                                   \
+    r1 += (t0 >> biLH);                             \
+    r1 += (t1 >> biLH);                             \
+    t0 <<= biLH;                                    \
+    t1 <<= biLH;                                    \
+    r0 += t0;                                       \
+    r1 += (r0 < t0);                                \
+    r0 += t1;                                       \
+    r1 += (r0 < t1);                                \
+    c0 += r0;                                       \
+    c1 += (c0 < r0);                                \
+    c1 += r1;                                       \
+    c2 += (c1 < r1);                                \
+
+#define COMBA_STOP                                  \
+}
+
+#else
+
+#define COMBA_INIT                                  \
+{                                                   \
+    bn_udbl r;                                      \
+
+#define COMBA_MULADDC                               \
+                                                    \
+    r = (bn_udbl)(*px++) * (*py--) + c0;            \
+    c0 = (bn_digit)r;                               \
+    r = (bn_udbl)c1 + (r >> biL);                   \
+    c1 = (bn_digit)r;                               \
+    c2 += (bn_digit)(r >> biL);                     \
+
+#define COMBA_STOP                                  \
+}
+
+#endif
